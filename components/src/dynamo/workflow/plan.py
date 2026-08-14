@@ -57,7 +57,35 @@ class RemoteBinding:
             )
 
 
+@dataclass(frozen=True)
+class GenerateEndpointBinding(RemoteBinding):
+    """Bind a contracted stage to Dynamo's stock token Generate endpoint."""
+
+
 Binding = Union[InlineBinding, RemoteBinding]
+
+
+def validate_binding_contract(binding: Binding, contract: StageContract) -> None:
+    """Validate protocol-specific stage ports against one physical binding."""
+
+    if not isinstance(binding, GenerateEndpointBinding):
+        return
+    expected_inputs = {
+        "request": "json",
+        "encoder_features": "tensor",
+        "encoder_metadata": "json",
+    }
+    actual_inputs = {name: spec.type for name, spec in contract.inputs.items()}
+    if actual_inputs != expected_inputs:
+        raise WorkflowValidationError(
+            "Generate endpoint stage inputs must be request:json, "
+            "encoder_features:tensor, and encoder_metadata:json"
+        )
+    actual_outputs = {name: spec.type for name, spec in contract.outputs.items()}
+    if actual_outputs != {"chunk": "json"}:
+        raise WorkflowValidationError(
+            "Generate endpoint stage output must be chunk:json"
+        )
 
 
 def _validate_process_boundaries(
@@ -131,6 +159,9 @@ class ExecutionPlan:
                 f"missing={sorted(expected_stages - actual_stages)}, "
                 f"extra={sorted(actual_stages - expected_stages)}"
             )
+
+        for stage_id, contract in self.stage_contracts.items():
+            validate_binding_contract(bindings[stage_id], contract)
 
         _validate_process_boundaries(self.workflow, bindings)
         object.__setattr__(self, "bindings", MappingProxyType(bindings))
