@@ -70,19 +70,14 @@ def validate_binding_contract(binding: Binding, contract: StageContract) -> None
 
     if not isinstance(binding, GenerateEndpointBinding):
         return
-    expected_inputs = {
-        "request": "json",
-        "encoder_features": "tensor",
-        "encoder_metadata": "json",
-    }
+    expected_inputs = {"request": "json"}
     actual_inputs = {
         name: _require_value_spec(spec, f"Generate endpoint input {name!r}").type
         for name, spec in contract.inputs.items()
     }
     if actual_inputs != expected_inputs:
         raise WorkflowValidationError(
-            "Generate endpoint stage inputs must be request:json, "
-            "encoder_features:tensor, and encoder_metadata:json"
+            "Generate endpoint stage input must be request:json"
         )
     actual_outputs = {
         name: _require_value_spec(spec, f"Generate endpoint output {name!r}").type
