@@ -1651,9 +1651,9 @@ impl ResponseMetricCollector {
         self.pylon_request = Some(super::pylon_stats::PylonRequestStats::new(stats, identity));
     }
 
-    fn observe_pylon_request(&mut self, generated_tokens: usize) {
+    fn observe_pylon_request(&mut self, input_tokens: usize, generated_tokens: usize) {
         if let Some(request) = self.pylon_request.as_mut() {
-            request.observe(generated_tokens);
+            request.observe(input_tokens, generated_tokens);
         }
     }
 
@@ -2023,7 +2023,7 @@ fn observe_llm_metrics(
     response_collector: &mut ResponseMetricCollector,
     http_queue_guard: &mut Option<HttpQueueGuard>,
 ) {
-    response_collector.observe_pylon_request(metrics.chunk_tokens);
+    response_collector.observe_pylon_request(metrics.input_tokens, metrics.chunk_tokens);
     response_collector.observe_current_osl(metrics.output_tokens);
     response_collector.observe_cached_tokens(metrics.cached_tokens);
     response_collector.observe_multimodal_metrics(

@@ -33,6 +33,7 @@ use tokio::time::{MissedTickBehavior, timeout};
 
 const MODEL: &str = "pylon-e2e";
 const PYLON_ID: &str = "pylon-e2e";
+const ACTUAL_INPUT_TOKENS: u64 = 12;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,7 +124,8 @@ impl
                     None,
                 );
                 response.llm_metrics = Some(LLMMetricAnnotation {
-                    input_tokens: 12,
+                    input_tokens: usize::try_from(ACTUAL_INPUT_TOKENS)
+                        .expect("fixture input tokens should fit usize"),
                     output_tokens,
                     chunk_tokens,
                     ..Default::default()
@@ -732,7 +734,7 @@ impl DiagnosticStream {
     ) -> Result<CollectedBatch> {
         let expected = requests
             .iter()
-            .map(|request| (request.id.clone(), request.input_tokens))
+            .map(|request| (request.id.clone(), ACTUAL_INPUT_TOKENS))
             .collect::<HashMap<_, _>>();
         let mut events: HashMap<String, Vec<StatsEvent>> = HashMap::new();
         let mut finished = HashSet::new();
@@ -951,7 +953,7 @@ fn validate_request_events(
 #[derive(Clone, Debug)]
 struct RequestSpec {
     id: String,
-    input_tokens: u64,
+    estimated_input_tokens: u64,
     cancel_after_first_chunk: bool,
 }
 
@@ -1182,7 +1184,7 @@ async fn run(args: &Args) -> Result<TestReport> {
     let mut previous_timestamp = 0;
     let phase_one = vec![RequestSpec {
         id: "e2e-happy-1".to_string(),
-        input_tokens: 12,
+        estimated_input_tokens: 120,
         cancel_after_first_chunk: false,
     }];
     let batch = report
@@ -1205,7 +1207,7 @@ async fn run(args: &Args) -> Result<TestReport> {
     let concurrency = (0..16)
         .map(|index| RequestSpec {
             id: format!("e2e-concurrent-{index:02}"),
-            input_tokens: 20 + index,
+            estimated_input_tokens: 20 + index,
             cancel_after_first_chunk: false,
         })
         .collect::<Vec<_>>();
@@ -1228,7 +1230,7 @@ async fn run(args: &Args) -> Result<TestReport> {
 
     let cancellation = vec![RequestSpec {
         id: "e2e-cancelled".to_string(),
-        input_tokens: 37,
+        estimated_input_tokens: 37,
         cancel_after_first_chunk: true,
     }];
     let batch = report
@@ -1280,7 +1282,7 @@ async fn run(args: &Args) -> Result<TestReport> {
         let requests = (0..2)
             .map(|index| RequestSpec {
                 id: format!("e2e-restart-{cycle}-{index}"),
-                input_tokens: 40 + cycle * 10 + index,
+                estimated_input_tokens: 40 + cycle * 10 + index,
                 cancel_after_first_chunk: false,
             })
             .collect::<Vec<_>>();
@@ -1323,12 +1325,12 @@ async fn run(args: &Args) -> Result<TestReport> {
     let after_pylon_restart = vec![
         RequestSpec {
             id: "e2e-pylon-restart-0".to_string(),
-            input_tokens: 81,
+            estimated_input_tokens: 81,
             cancel_after_first_chunk: false,
         },
         RequestSpec {
             id: "e2e-pylon-restart-1".to_string(),
-            input_tokens: 82,
+            estimated_input_tokens: 82,
             cancel_after_first_chunk: false,
         },
     ];
@@ -1449,7 +1451,7 @@ async fn send_request(
         .post(format!("http://{stargate_http_addr}/v1/chat/completions"))
         .header("x-request-id", &request.id)
         .header("x-model", MODEL)
-        .header("x-input-tokens", request.input_tokens)
+        .header("x-input-tokens", request.estimated_input_tokens)
         .header("x-priority", 0)
         .json(&json!({
             "model": MODEL,

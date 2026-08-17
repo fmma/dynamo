@@ -23,7 +23,6 @@ use super::{RouteDoc, service_v2};
 const STATS_PATH: &str = "/pylon/v1/stats/stream";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const MODEL_HEADER: &str = "x-model";
-const INPUT_TOKENS_HEADER: &str = "x-input-tokens";
 const IDENTITY_CONTEXT_KEY: &str = "pylon_request_identity";
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -33,7 +32,6 @@ const PING_LINE: &[u8] = b"{\"v\":1,\"type\":\"ping\"}\n";
 pub(super) struct PylonRequestIdentity {
     request_id: String,
     model: String,
-    input_tokens: u64,
 }
 
 impl PylonRequestIdentity {
@@ -41,9 +39,6 @@ impl PylonRequestIdentity {
         Some(Self {
             request_id: nonempty_header(headers, REQUEST_ID_HEADER)?,
             model: nonempty_header(headers, MODEL_HEADER)?,
-            input_tokens: nonempty_header(headers, INPUT_TOKENS_HEADER)?
-                .parse()
-                .ok()?,
         })
     }
 }
@@ -119,7 +114,7 @@ struct RequestStatsEvent<'a> {
 pub(super) struct PylonRequestStats {
     stats: PylonStats,
     identity: PylonRequestIdentity,
-    observed: bool,
+    tokens_processed: Option<u64>,
     tokens_generated: Option<u64>,
 }
 
@@ -128,18 +123,22 @@ impl PylonRequestStats {
         Self {
             stats,
             identity,
-            observed: false,
+            tokens_processed: None,
             tokens_generated: None,
         }
     }
 
-    pub(super) fn observe(&mut self, generated_tokens: usize) {
+    pub(super) fn observe(&mut self, input_tokens: usize, generated_tokens: usize) {
+        let input_tokens = u64::try_from(input_tokens).unwrap_or(u64::MAX);
         let generated_tokens = u64::try_from(generated_tokens).unwrap_or(u64::MAX);
 
-        // A response observation means input processing completed, even when it
-        // contains no generated tokens.
-        let tokens_processed = (!self.observed).then_some(self.identity.input_tokens);
-        self.observed = true;
+        // Prompt-embedding paths can report zero until backend usage arrives.
+        // Publish only positive, monotonic counts so a later exact value can win.
+        let previous = self.tokens_processed.unwrap_or_default();
+        let tokens_processed = (input_tokens > previous).then(|| {
+            self.tokens_processed = Some(input_tokens);
+            input_tokens
+        });
         let tokens_generated = if generated_tokens > 0 {
             let previous = self.tokens_generated.unwrap_or_default();
             let total = previous.saturating_add(generated_tokens);
@@ -182,11 +181,7 @@ impl PylonRequestStats {
 
 impl Drop for PylonRequestStats {
     fn drop(&mut self) {
-        self.publish(
-            self.observed.then_some(self.identity.input_tokens),
-            self.tokens_generated,
-            true,
-        );
+        self.publish(self.tokens_processed, self.tokens_generated, true);
     }
 }
 
@@ -251,7 +246,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static(request_id));
         headers.insert(MODEL_HEADER, HeaderValue::from_static(model));
-        headers.insert(INPUT_TOKENS_HEADER, HeaderValue::from_static("3"));
         headers
     }
 
@@ -271,7 +265,6 @@ mod tests {
             Some(PylonRequestIdentity {
                 request_id: "pylon-id".to_string(),
                 model: "external-model".to_string(),
-                input_tokens: 3,
             })
         );
     }
@@ -290,24 +283,26 @@ mod tests {
             Some(PylonRequestIdentity {
                 request_id: "pylon-id".to_string(),
                 model: "external-model".to_string(),
-                input_tokens: 3,
             })
         );
     }
 
     #[test]
-    fn identity_requires_all_valid_tunnel_headers() {
+    fn identity_requires_request_id_and_model() {
         let mut missing_model = HeaderMap::new();
         missing_model.insert(REQUEST_ID_HEADER, HeaderValue::from_static("pylon-id"));
-        missing_model.insert(INPUT_TOKENS_HEADER, HeaderValue::from_static("3"));
         assert_eq!(PylonRequestIdentity::from_headers(&missing_model), None);
         assert_eq!(
             PylonRequestIdentity::from_headers(&headers("pylon-id", "   ")),
             None
         );
-        let mut invalid_tokens = headers("pylon-id", "model");
-        invalid_tokens.insert(INPUT_TOKENS_HEADER, HeaderValue::from_static("three"));
-        assert_eq!(PylonRequestIdentity::from_headers(&invalid_tokens), None);
+
+        let mut missing_request_id = HeaderMap::new();
+        missing_request_id.insert(MODEL_HEADER, HeaderValue::from_static("model"));
+        assert_eq!(
+            PylonRequestIdentity::from_headers(&missing_request_id),
+            None
+        );
     }
 
     #[tokio::test]
@@ -320,13 +315,12 @@ mod tests {
                 PylonRequestIdentity {
                     request_id: "pylon-id".to_string(),
                     model: "external-model".to_string(),
-                    input_tokens: 3,
                 },
             );
-            request.observe(0);
-            request.observe(2);
-            request.observe(3);
-            request.observe(0);
+            request.observe(3, 0);
+            request.observe(3, 2);
+            request.observe(3, 3);
+            request.observe(3, 0);
         }
 
         let processed = json(&receiver.recv().await.unwrap());
@@ -353,6 +347,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_input_count_is_published_when_known() {
+        let stats = PylonStats::default();
+        let mut receiver = stats.subscribe();
+        {
+            let mut request = PylonRequestStats::new(
+                stats.clone(),
+                PylonRequestIdentity {
+                    request_id: "pylon-id".to_string(),
+                    model: "external-model".to_string(),
+                },
+            );
+            request.observe(0, 2);
+            request.observe(12, 3);
+        }
+
+        let generated = json(&receiver.recv().await.unwrap());
+        assert!(generated.get("tokens_processed").is_none());
+        assert_eq!(generated["tokens_generated"], 2);
+
+        let processed = json(&receiver.recv().await.unwrap());
+        assert_eq!(processed["tokens_processed"], 12);
+        assert_eq!(processed["tokens_generated"], 5);
+
+        let finished = json(&receiver.recv().await.unwrap());
+        assert_eq!(finished["tokens_processed"], 12);
+        assert_eq!(finished["tokens_generated"], 5);
+        assert_eq!(finished["finished"], true);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
     async fn unobserved_request_finishes_without_counters() {
         let stats = PylonStats::default();
         let mut receiver = stats.subscribe();
@@ -361,7 +386,6 @@ mod tests {
             PylonRequestIdentity {
                 request_id: "pylon-id".to_string(),
                 model: "external-model".to_string(),
-                input_tokens: 3,
             },
         );
 
