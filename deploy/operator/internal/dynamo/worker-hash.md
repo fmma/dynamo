@@ -57,13 +57,14 @@ runs at the beginning of reconciliation, before steady-state rollout decisions:
 
 The migration deliberately avoids an operator-upgrade-induced rollout. If an operator upgrade and a
 v2-relevant DGD edit happen together, recording v2 from the DGD can absorb that edit without a
-rollout. Dynamo 1.4 accepted this narrow compatibility tradeoff. The same tradeoff applies when a
-deployment upgrades directly from 1.3 to a later release.
+rollout. Dynamo 1.4 accepted this narrow compatibility tradeoff. A normally reconciled DGD from 1.2
+or later already has a v2 annotation, so this migration is relevant only to pre-v2 or incomplete
+annotation state.
 
 The semantic model does not require v1 to be recalculated. The 1.4 implementation still computes the
-legacy v1 hash only while recognizing an incomplete v1-only migration. It never computes v1 after a
-v2 annotation exists. This compatibility check is isolated migration machinery, not part of the
-steady-state rollout contract.
+legacy v1 hash only while recognizing such v1-only state. It never computes v1 after a v2 annotation
+exists. This compatibility check is not needed for normal upgrades from 1.2 or later and is isolated
+migration machinery, not part of the steady-state rollout contract.
 
 ## Steady-State Rollout Semantics
 
@@ -115,5 +116,5 @@ stored v1 values are opaque generation suffixes.
 
 The v2 annotation therefore first shipped in 1.2, participated in change detection in 1.2 and 1.3,
 and became the sole steady-state rollout comparison in 1.4. The controller stopped computing v1 for
-normal reconciliations in 1.4; it has not removed the legacy computation entirely because direct
-upgrade compatibility still uses it in the v1-only migration path.
+normal reconciliations in 1.4; the remaining legacy computation applies only to pre-v2 or incomplete
+v1-only annotation state, not to normal 1.3-to-1.5 or 1.4-to-1.5 upgrades.
