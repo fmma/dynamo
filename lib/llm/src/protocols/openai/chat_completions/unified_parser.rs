@@ -32,7 +32,7 @@
 //! [`ChatCompletionStreamResponseDelta`] carries `content`, `reasoning_content` and
 //! `tool_calls` side by side with no way to say which came first. Packing a whole
 //! `push` into one delta object would throw away exactly the ordering this path exists
-//! to preserve, so every [`UnifiedDelta`] becomes its own chunk.
+//! to preserve, so every [`UnifiedParserEvent`] becomes its own chunk.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -40,7 +40,8 @@ use std::sync::LazyLock;
 use async_stream::stream;
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
-    Tool, UnifiedDelta, UnifiedEvent, UnifiedParser, UnifiedParserPrefill, UnifiedToolOutputMode,
+    InvalidGuidedPayloadPolicy, Tool, UnifiedEvent, UnifiedParser, UnifiedParserEvent,
+    UnifiedParserExt, UnifiedParserInit, UnifiedParserStartingState, UnifiedToolOutputMode,
     create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
@@ -138,18 +139,18 @@ pub(crate) fn selected_family(
 pub(crate) fn stream_prefill(
     family: &str,
     prompt_injected_reasoning: bool,
-) -> UnifiedParserPrefill {
+) -> UnifiedParserStartingState {
     if prompt_injected_reasoning {
-        return UnifiedParserPrefill::Reasoning;
+        return UnifiedParserStartingState::Reasoning;
     }
     match family {
         // Qwen3's generation prompt ends at the assistant header with no channel open,
         // so the model emits `<think>` itself when it thinks.
-        QWEN3_UNIFIED_FAMILY => UnifiedParserPrefill::None,
+        QWEN3_UNIFIED_FAMILY => UnifiedParserStartingState::None,
         // A family whose non-thinking prompt ends INSIDE the visible response channel
         // would return `Response` here. None exists yet; an unknown family gets the
         // conservative answer, which is to assume the model opens its own channels.
-        _ => UnifiedParserPrefill::None,
+        _ => UnifiedParserStartingState::None,
     }
 }
 
@@ -159,14 +160,14 @@ pub(crate) fn stream_prefill(
 /// state is read back off the text: a `<think>` opener means the model opened reasoning
 /// itself; a bare `</think>` with no opener means the prompt had already opened it; and
 /// neither marker means reasoning never ran for this turn.
-fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserPrefill> {
+fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserStartingState> {
     match family {
         QWEN3_UNIFIED_FAMILY => Ok(if content.contains("<think>") {
-            UnifiedParserPrefill::None
+            UnifiedParserStartingState::None
         } else if content.contains("</think>") {
-            UnifiedParserPrefill::Reasoning
+            UnifiedParserStartingState::Reasoning
         } else {
-            UnifiedParserPrefill::Response
+            UnifiedParserStartingState::Response
         }),
         other => anyhow::bail!("no prefill detector for unified parser family '{other}'"),
     }
@@ -195,12 +196,10 @@ fn to_v2_tools(tools: Option<&[ToolDefinition]>) -> Vec<Tool> {
 ///
 /// Callers must not consult this when a structural tag is active — see
 /// [`apply_stream`]'s `uses_tool_call_structural_tag`.
-fn tool_output_mode(
-    tool_choice: Option<&ChatCompletionToolChoiceOption>,
-) -> UnifiedToolOutputMode<'_> {
+fn tool_output_mode(tool_choice: Option<&ChatCompletionToolChoiceOption>) -> UnifiedToolOutputMode {
     match tool_choice {
         Some(ChatCompletionToolChoiceOption::Named(named)) => UnifiedToolOutputMode::GuidedJson {
-            named_tool: Some(&named.function.name),
+            named_tool: Some(named.function.name.clone()),
         },
         Some(ChatCompletionToolChoiceOption::Required) => {
             UnifiedToolOutputMode::GuidedJson { named_tool: None }
@@ -217,14 +216,14 @@ fn tool_output_mode(
 /// Tool-call deltas never merge: two fragments belonging to different `tool_index`es
 /// would fuse into one call, and even two fragments of the SAME call must keep their
 /// `name`-carrying first delta distinct from later argument-only ones.
-fn coalesce(deltas: Vec<UnifiedDelta>) -> Vec<UnifiedDelta> {
-    let mut out: Vec<UnifiedDelta> = Vec::with_capacity(deltas.len());
+fn coalesce(deltas: Vec<UnifiedParserEvent>) -> Vec<UnifiedParserEvent> {
+    let mut out: Vec<UnifiedParserEvent> = Vec::with_capacity(deltas.len());
     for delta in deltas {
         match (out.last_mut(), delta) {
-            (Some(UnifiedDelta::Text { text: prev }), UnifiedDelta::Text { text }) => {
+            (Some(UnifiedParserEvent::Text(prev)), UnifiedParserEvent::Text(text)) => {
                 prev.push_str(&text)
             }
-            (Some(UnifiedDelta::Reasoning { text: prev }), UnifiedDelta::Reasoning { text }) => {
+            (Some(UnifiedParserEvent::Reasoning(prev)), UnifiedParserEvent::Reasoning(text)) => {
                 prev.push_str(&text)
             }
             (_, delta) => out.push(delta),
@@ -275,11 +274,24 @@ impl ChoiceState {
     fn new(
         family: &'static str,
         tools: &[Tool],
-        prefill: UnifiedParserPrefill,
-        tool_output_mode: UnifiedToolOutputMode<'_>,
+        prefill: UnifiedParserStartingState,
+        tool_output_mode: UnifiedToolOutputMode,
     ) -> anyhow::Result<Self> {
         let mut parser = create_unified_parser_for_family(family, tools)?;
-        parser.initialize_with_output_mode(prefill, tool_output_mode)?;
+        // `prompt_token_ids` stays empty: this path establishes the starting state from
+        // the rendered prompt text (see `stream_prefill` / `detect_prefill`), not from
+        // token IDs, which the preprocessor has already consumed by this point.
+        //
+        // `Reject` rather than `RecoverAsText`: a guided-decoding contract violation is a
+        // backend bug, and surfacing the bytes as content would silently serve a malformed
+        // tool call as prose. The error lands on `give_up`, which already replays the
+        // buffered bytes as text and logs — so nothing is dropped, but it is not silent.
+        parser.initialize_request(UnifiedParserInit {
+            prompt_token_ids: Vec::new(),
+            starting_state: prefill,
+            tool_output_mode,
+            invalid_guided_payload: InvalidGuidedPayloadPolicy::Reject,
+        })?;
         Ok(Self {
             family,
             parser,
@@ -290,7 +302,7 @@ impl ChoiceState {
     }
 
     /// Feed one decoded text delta through the parser.
-    fn push(&mut self, text: &str) -> Vec<UnifiedDelta> {
+    fn push(&mut self, text: &str) -> Vec<UnifiedParserEvent> {
         if self.failed {
             return text_delta(text.to_string());
         }
@@ -308,12 +320,14 @@ impl ChoiceState {
     }
 
     /// Flush buffered partial state at end of stream.
-    fn finish(&mut self) -> Vec<UnifiedDelta> {
+    fn finish(&mut self) -> Vec<UnifiedParserEvent> {
         if self.failed {
             return Vec::new();
         }
         match self.parser.finish() {
-            Ok(deltas) => deltas,
+            // `finish` now hands back the whole `UnifiedParserOutput`; this path only ever
+            // wants the ordered events out of it.
+            Ok(output) => output.events,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -332,7 +346,7 @@ impl ChoiceState {
     /// truncated answer with no indication anything was lost — so they go out as
     /// visible text. When the parser had nothing buffered, the chunk that broke it
     /// does instead, so that chunk is not lost either.
-    fn give_up(&mut self, fallback: &str) -> Vec<UnifiedDelta> {
+    fn give_up(&mut self, fallback: &str) -> Vec<UnifiedParserEvent> {
         self.failed = true;
         let recovered = self.parser.reset();
         if recovered.is_empty() {
@@ -343,16 +357,16 @@ impl ChoiceState {
     }
 
     /// Convert one ordered delta into a streaming choice for `index`.
-    fn delta_to_choice(&mut self, index: u32, delta: UnifiedDelta) -> ChatChoiceStream {
+    fn delta_to_choice(&mut self, index: u32, delta: UnifiedParserEvent) -> ChatChoiceStream {
         let mut choice = empty_choice(index);
         match delta {
-            UnifiedDelta::Text { text } => {
+            UnifiedParserEvent::Text(text) => {
                 choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
             }
-            UnifiedDelta::Reasoning { text } => {
+            UnifiedParserEvent::Reasoning(text) => {
                 choice.delta.reasoning_content = Some(text);
             }
-            UnifiedDelta::ToolCall(call) => {
+            UnifiedParserEvent::ToolCall(call) => {
                 self.tool_emitted = true;
                 // The OpenAI streaming tool-call contract: the FIRST chunk for a tool
                 // index carries id + type + name, later chunks carry only argument
@@ -381,7 +395,7 @@ impl ChoiceState {
     fn choices_for(
         &mut self,
         original: &ChatChoiceStream,
-        deltas: Vec<UnifiedDelta>,
+        deltas: Vec<UnifiedParserEvent>,
         finish_reason: Option<FinishReason>,
     ) -> Vec<ChatChoiceStream> {
         let deltas = coalesce(deltas);
@@ -433,11 +447,11 @@ impl ChoiceState {
 
 /// One text delta, or nothing at all when the text is empty — an empty content chunk
 /// carries no information and clients render it as a stray empty string.
-fn text_delta(text: String) -> Vec<UnifiedDelta> {
+fn text_delta(text: String) -> Vec<UnifiedParserEvent> {
     if text.is_empty() {
         Vec::new()
     } else {
-        vec![UnifiedDelta::Text { text }]
+        vec![UnifiedParserEvent::Text(text)]
     }
 }
 
@@ -459,7 +473,13 @@ pub(crate) struct CompleteOutput {
 /// on the streaming path, which is where a client can act on it.
 pub(crate) fn parse_complete(family: &str, content: &str) -> anyhow::Result<CompleteOutput> {
     let mut parser = create_unified_parser_for_family(family, &[])?;
-    parser.initialize(detect_prefill(family, content)?)?;
+    // Batch replays already-generated output, so there is no `tool_choice` to honour and
+    // no guided-decoding constraint in play: native markup, default malformed policy.
+    // Only the starting state, recovered from the content itself, carries over.
+    parser.initialize_request(UnifiedParserInit {
+        starting_state: detect_prefill(family, content)?,
+        ..UnifiedParserInit::default()
+    })?;
 
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -558,7 +578,7 @@ pub(crate) fn apply_stream<S>(
     tool_definitions: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
-    prefill: UnifiedParserPrefill,
+    prefill: UnifiedParserStartingState,
     family: &'static str,
 ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
 where
@@ -824,7 +844,7 @@ mod tests {
         assert_eq!(
             tool_output_mode(Some(&named)),
             UnifiedToolOutputMode::GuidedJson {
-                named_tool: Some("get_weather")
+                named_tool: Some("get_weather".to_string())
             }
         );
         assert_eq!(
@@ -859,7 +879,7 @@ mod tests {
             Some(weather_tools()),
             Some(ChatCompletionToolChoiceOption::Required),
             true,
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -883,12 +903,12 @@ mod tests {
     fn prompt_injected_reasoning_selects_the_reasoning_prefill() {
         assert_eq!(
             stream_prefill(QWEN3_UNIFIED_FAMILY, true),
-            UnifiedParserPrefill::Reasoning
+            UnifiedParserStartingState::Reasoning
         );
         // Qwen3's template pre-opens no channel, so the model emits `<think>` itself.
         assert_eq!(
             stream_prefill(QWEN3_UNIFIED_FAMILY, false),
-            UnifiedParserPrefill::None
+            UnifiedParserStartingState::None
         );
     }
 
@@ -896,23 +916,23 @@ mod tests {
     fn detects_batch_prefill_from_complete_output() {
         assert_eq!(
             detect_prefill(QWEN3_UNIFIED_FAMILY, "<think>reason</think>answer").unwrap(),
-            UnifiedParserPrefill::None
+            UnifiedParserStartingState::None
         );
         assert_eq!(
             detect_prefill(QWEN3_UNIFIED_FAMILY, "reason</think>answer").unwrap(),
-            UnifiedParserPrefill::Reasoning
+            UnifiedParserStartingState::Reasoning
         );
         assert_eq!(
             detect_prefill(QWEN3_UNIFIED_FAMILY, "answer").unwrap(),
-            UnifiedParserPrefill::Response
+            UnifiedParserStartingState::Response
         );
         assert!(detect_prefill("kimi_k3", "answer").is_err());
     }
 
     // --- delta -> chunk conversion -----------------------------------------------
 
-    fn call_delta(tool_index: usize, name: Option<&str>, arguments: &str) -> UnifiedDelta {
-        UnifiedDelta::ToolCall(ToolCallDelta {
+    fn call_delta(tool_index: usize, name: Option<&str>, arguments: &str) -> UnifiedParserEvent {
+        UnifiedParserEvent::ToolCall(ToolCallDelta {
             tool_index,
             name: name.map(str::to_string),
             arguments: arguments.to_string(),
@@ -923,7 +943,7 @@ mod tests {
         ChoiceState::new(
             QWEN3_UNIFIED_FAMILY,
             &[],
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             UnifiedToolOutputMode::Native,
         )
         .expect("qwen3 unified parser")
@@ -937,16 +957,10 @@ mod tests {
         let choices = state.choices_for(
             &base,
             vec![
-                UnifiedDelta::Reasoning {
-                    text: "look it up".into(),
-                },
+                UnifiedParserEvent::Reasoning("look it up".into()),
                 call_delta(0, Some("get_weather"), r#"{"city":"Tokyo"}"#),
-                UnifiedDelta::Reasoning {
-                    text: "now answer".into(),
-                },
-                UnifiedDelta::Text {
-                    text: "It's 18C.".into(),
-                },
+                UnifiedParserEvent::Reasoning("now answer".into()),
+                UnifiedParserEvent::Text("It's 18C.".into()),
             ],
             Some(FinishReason::Stop),
         );
@@ -1033,23 +1047,18 @@ mod tests {
     #[test]
     fn adjacent_same_kind_deltas_coalesce_but_calls_never_do() {
         let merged = coalesce(vec![
-            UnifiedDelta::Text { text: "he".into() },
-            UnifiedDelta::Text { text: "llo".into() },
+            UnifiedParserEvent::Text("he".into()),
+            UnifiedParserEvent::Text("llo".into()),
             call_delta(0, Some("f"), "{"),
             call_delta(0, None, "}"),
-            UnifiedDelta::Reasoning { text: "a".into() },
-            UnifiedDelta::Reasoning { text: "b".into() },
+            UnifiedParserEvent::Reasoning("a".into()),
+            UnifiedParserEvent::Reasoning("b".into()),
         ]);
         assert_eq!(merged.len(), 4);
-        assert_eq!(
-            merged[0],
-            UnifiedDelta::Text {
-                text: "hello".into()
-            }
-        );
+        assert_eq!(merged[0], UnifiedParserEvent::Text("hello".into()));
         assert_eq!(merged[1], call_delta(0, Some("f"), "{"));
         assert_eq!(merged[2], call_delta(0, None, "}"));
-        assert_eq!(merged[3], UnifiedDelta::Reasoning { text: "ab".into() });
+        assert_eq!(merged[3], UnifiedParserEvent::Reasoning("ab".into()));
     }
 
     #[test]
@@ -1060,7 +1069,7 @@ mod tests {
         let choices = state.choices_for(
             &base,
             vec![
-                UnifiedDelta::Text { text: "a".into() },
+                UnifiedParserEvent::Text("a".into()),
                 call_delta(0, Some("f"), "{}"),
             ],
             Some(FinishReason::Stop),
@@ -1117,7 +1126,7 @@ mod tests {
             Some(weather_tools()),
             None,
             false,
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1170,7 +1179,7 @@ mod tests {
             Some(weather_tools()),
             Some(named_choice("get_weather")),
             false,
-            UnifiedParserPrefill::Reasoning,
+            UnifiedParserStartingState::Reasoning,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1202,7 +1211,7 @@ mod tests {
             Some(weather_tools()),
             Some(ChatCompletionToolChoiceOption::Required),
             false,
-            UnifiedParserPrefill::Reasoning,
+            UnifiedParserStartingState::Reasoning,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1229,7 +1238,7 @@ mod tests {
             None,
             None,
             false,
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1255,7 +1264,7 @@ mod tests {
             Some(weather_tools()),
             None,
             false,
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1279,7 +1288,7 @@ mod tests {
             None,
             None,
             false,
-            UnifiedParserPrefill::None,
+            UnifiedParserStartingState::None,
             QWEN3_UNIFIED_FAMILY,
         )
         .collect::<Vec<_>>()
@@ -1301,26 +1310,20 @@ mod tests {
         // bytes that could still turn out to be a `<tool_call>` opener.
         assert_eq!(
             state.push("hello <tool_c"),
-            vec![UnifiedDelta::Text {
-                text: "hello ".into()
-            }]
+            vec![UnifiedParserEvent::Text("hello ".into())]
         );
         // Now force the failure path with those held-back bytes still buffered.
         let recovered = state.give_up("");
         assert_eq!(
             recovered,
-            vec![UnifiedDelta::Text {
-                text: "<tool_c".into()
-            }],
+            vec![UnifiedParserEvent::Text("<tool_c".into())],
             "buffered bytes must be surfaced, not silently dropped"
         );
         assert!(state.failed);
         // Every later chunk now passes through as plain text.
         assert_eq!(
             state.push("more"),
-            vec![UnifiedDelta::Text {
-                text: "more".into()
-            }]
+            vec![UnifiedParserEvent::Text("more".into())]
         );
         assert!(state.finish().is_empty());
     }
@@ -1330,9 +1333,7 @@ mod tests {
         let mut state = test_state();
         assert_eq!(
             state.give_up("the chunk that broke it"),
-            vec![UnifiedDelta::Text {
-                text: "the chunk that broke it".into()
-            }]
+            vec![UnifiedParserEvent::Text("the chunk that broke it".into())]
         );
     }
 
