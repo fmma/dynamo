@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Pull Request Branch Maintenance
+
+# This controller is loaded from the default branch. It never checks out or
+# executes code from the pull-request branch that it removes.
+on:
+  workflow_run:
+    workflows:
+      - PR
+      - PR-XPU
+      - Fern Docs
+      - Request NVSkills CI
+    types: [requested, in_progress]
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pull-request-branch-maintenance-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Update pull request workflow state
+    if: ${{ github.event.workflow_run.event == 'push' }}
+    environment: pull-request-branch-cleanup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the controller from the default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Create a short-lived maintenance token
+        id: maintenance-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.PR_BRANCH_CLEANER_CLIENT_ID }}
+          private-key: ${{ secrets.PR_BRANCH_CLEANER_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Update workflow state
+        env:
+          BRANCH_DELETE_TOKEN: ${{ steps.maintenance-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/cleanup_pull_request_branches.py
+          --repository "$GITHUB_REPOSITORY"
+          --event-path "$GITHUB_EVENT_PATH"
