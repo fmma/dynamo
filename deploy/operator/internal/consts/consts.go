@@ -121,7 +121,7 @@ const (
 
 	KubeResourceGPUNvidia = "nvidia.com/gpu"
 
-	// KV transfer policy env vars (worker) — injected when
+	// EnvKvTransferDomain KV transfer policy env vars (worker) — injected when
 	// spec.experimental.kvTransferPolicy is configured. Workers publish these
 	// in their MDC so the router reads policy per-worker rather than from its
 	// own env.
@@ -129,12 +129,12 @@ const (
 	EnvKvTransferEnforcement     = "DYN_KV_TRANSFER_ENFORCEMENT"
 	EnvKvTransferPreferredWeight = "DYN_KV_TRANSFER_PREFERRED_WEIGHT"
 
-	// Topology env vars (worker) injected when
+	// EnvTopologyEnabled Topology env vars (worker) injected when
 	// spec.experimental.kvTransferPolicy is configured.
 	EnvTopologyEnabled   = "DYN_TOPOLOGY_ENABLED"
 	EnvTopologyMountPath = "DYN_TOPOLOGY_MOUNT_PATH"
 
-	// Topology source annotations are set on worker pods when spec.experimental.kvTransferPolicy is
+	// KubeAnnotationTopologyLabelKey Topology source annotations are set on worker pods when spec.experimental.kvTransferPolicy is
 	// configured. The topology label controller watches for pods being scheduled with these annotations
 	// and uses the annotation value to determine the node label(s) to copy onto the pod. The copied labels
 	// are projected through a Downward API volume for the runtime to consume (i.e. zone="us-east-1a")
@@ -175,11 +175,11 @@ const (
 
 	DefaultGroveTerminationDelay = 15 * time.Minute
 
-	// Operator origin version: stamped on DGD at creation time by mutating webhook.
+	// KubeAnnotationDynamoOperatorOriginVersion Operator origin version: stamped on DGD at creation time by mutating webhook.
 	// Records which operator version created the resource, enabling version-gated behavior changes.
 	KubeAnnotationDynamoOperatorOriginVersion = "nvidia.com/dynamo-operator-origin-version"
 
-	// vLLM distributed executor backend override annotation.
+	// KubeAnnotationVLLMDistributedExecutorBackend vLLM distributed executor backend override annotation.
 	// Users can set this on a DGD to explicitly choose "mp" or "ray" for multi-node vLLM deployments.
 	// When present, takes priority over the version-based default.
 	KubeAnnotationVLLMDistributedExecutorBackend = "nvidia.com/vllm-distributed-executor-backend"

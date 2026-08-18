@@ -667,11 +667,17 @@ func registerControllers(
 	}); err != nil {
 		return err
 	}
-	if err := controller.SetupDynamoCheckpoint(mgr, setupOptions); err != nil {
-		return err
+	// The DynamoCheckpoint controller Owns() the external Snapshot operator's
+	// PodSnapshot CRD (github.com/ai-dynamo/snapshot), which is not installed
+	// by default (global.snapshot.install=false). Gating this registration on
+	// the Checkpoint feature keeps a default install, where checkpointing and
+	// the Snapshot chart are both off, from failing manager startup on a
+	// missing CRD.
+	if runtimeConfig.Gate.Enabled(features.Checkpoint) {
+		if err := controller.SetupDynamoCheckpoint(mgr, setupOptions); err != nil {
+			return err
+		}
 	}
-	// PodSnapshot/PodSnapshotContent reconciliation is owned by the external
-	// Snapshot operator (github.com/ai-dynamo/snapshot).
 
 	if runtimeConfig.Gate.Enabled(features.Grove) {
 		if err := controller.SetupFailoverCascade(mgr); err != nil {
